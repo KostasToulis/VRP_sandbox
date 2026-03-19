@@ -3,7 +3,8 @@ from typing import List, Tuple
 from model import VRPModel, Solution, Route, Node
 
 class RandomKeyOptimizer:
-    def __init__(self, model: VRPModel, population_size: int = 100, generations: int = 500, elite_size: int = 20, mutant_size: int = 15):
+    def __init__(self, model: VRPModel, population_size: int = 100, generations: int = 500,
+                 elite_size: int = 20, mutant_size: int = 15, seed: int | None = None):
         self.model = model
         self.population_size = population_size
         self.generations = generations
@@ -12,6 +13,8 @@ class RandomKeyOptimizer:
         self.mutant_size = mutant_size
         self.nodes = [n for n in model.nodes if n.id != model.depot_id]
         self.num_nodes = len(self.nodes)
+        if seed is not None:
+            random.seed(seed)
 
     def solve(self) -> Solution:
         # A solution is represented by a vector of random keys (floats in [0, 1])
@@ -25,7 +28,7 @@ class RandomKeyOptimizer:
         population.sort(key=lambda x: x[1].cost)
         best_solution = population[0][1]
 
-        for gen in range(self.generations):
+        for _ in range(self.generations):
             # 2. Classify Population
             elite = population[:self.elite_size]
             non_elite = population[self.elite_size:]

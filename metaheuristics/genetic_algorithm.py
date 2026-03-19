@@ -1,15 +1,18 @@
 import random
-from typing import List, Tuple
+from typing import List
 from model import VRPModel, Route, Solution, Node
 
 class GeneticAlgorithm:
-    def __init__(self, model: VRPModel, population_size: int = 100, generations: int = 500, mutation_rate: float = 0.1, tournament_size: int = 5):
+    def __init__(self, model: VRPModel, population_size: int = 100, generations: int = 500,
+                 mutation_rate: float = 0.1, tournament_size: int = 5, seed: int | None = None):
         self.model = model
         self.population_size = population_size
         self.generations = generations
         self.mutation_rate = mutation_rate
         self.tournament_size = tournament_size
         self.customers = [n for n in model.nodes if n.id != model.depot_id]
+        if seed is not None:
+            random.seed(seed)
 
     def solve(self) -> Solution:
         population = self._initial_population()

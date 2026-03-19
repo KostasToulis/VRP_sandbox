@@ -1,6 +1,6 @@
 import pulp
-from typing import List, Tuple, Set
-from model import VRPModel, Solution, Route, Node
+from typing import List, Tuple
+from model import VRPModel, Solution, Route
 
 class BranchAndCut:
     def __init__(self, model: VRPModel, time_limit: int = 600):
@@ -21,9 +21,15 @@ class BranchAndCut:
         for i in node_ids:
             for j in node_ids:
                 if i != j:
-                    dist = self.model.get_distance(i, j)
                     x[i, j] = pulp.LpVariable(f"x_{i}_{j}", cat=pulp.LpBinary)
-                    prob += x[i, j] * dist # Objective function term
+
+        # Objective: minimise total travel distance.
+        # Must be set as a single lpSum — using `prob += term` inside a loop
+        # would replace (not accumulate) the objective on every iteration in PuLP.
+        prob += pulp.lpSum(
+            self.model.get_distance(i, j) * x[i, j]
+            for i in node_ids for j in node_ids if i != j
+        )
 
         # Constraints
         # 1. Degree constraints: Each customer has exactly one outgoing and one incoming edge
@@ -52,13 +58,12 @@ class BranchAndCut:
                     if i != j and pulp.value(x[i, j]) > 0.9:
                         edges.append((i, j))
 
-            subtours = self._find_subtours(edges, node_ids)
-            
+            subtours = self._find_subtours(edges)
+
             # Check for generic subtours (not connected to depot) or capacity violations
             cuts_added = 0
-            
+
             for subtour in subtours:
-                subtour_load = sum(self.model.node_map[nid].demand for nid in subtour)
                 is_depot_in_subtour = depot_id in subtour
 
                 # Case 1: Subtour does not contain depot -> Valid SEC required
@@ -110,61 +115,33 @@ class BranchAndCut:
 
         return Solution(cost=float('inf'), routes=[])
 
-    def _find_subtours(self, edges: List[Tuple[int, int]], all_nodes: List[int]) -> List[List[int]]:
-        adj = {i: [] for i in all_nodes}
-        for u, v in edges:
-            adj[u].append(v)
-            # adj[v].append(u) # Directed
+    def _find_subtours(self, edges: List[Tuple[int, int]]) -> List[List[int]]:
+        """Detect cycles by following unique next-node pointers.
 
-        visited = set()
-        subtours = []
-        
-        for n in all_nodes:
-            if n not in visited and (n in adj and adj[n]): # only check nodes involved in solution or all?
-                # Actually, check all nodes that have flow.
-                # If a node has no flow, it's isolated (shouldn't happen for customers due to constraints).
-                component = []
-                stack = [n]
-                visited.add(n)
-                while stack:
-                    curr = stack.pop()
-                    component.append(curr)
-                    for neighbor in adj.get(curr, []):
-                        # Treat as undirected for connectivity?
-                        # Standard subtour logic usually looks for cycles. 
-                        # In directed, strict connectivity (SCC) matters, but for basic subtour elimination 
-                        # just finding weakly connected components is often enough if we only care about "is it disconnected from depot".
-                        if neighbor not in visited:
-                            visited.add(neighbor)
-                            stack.append(neighbor)
-                subtours.append(component)
-        
-        # Merge logic issues: strictly, for directed graph x_ij=1, we follow paths.
-        # A simpler way: just follow next_node pointers.
-        
+        In a feasible integer solution each node has out-degree exactly 1,
+        so edges form a set of disjoint directed cycles.  Following successor
+        pointers from each unprocessed start node recovers those cycles without
+        any ambiguity.
+        """
         next_node = {u: v for u, v in edges}
-        visited_cycle = set()
-        cycles = []
-        
-        nodes_with_flow = list(next_node.keys())
-        processed = set()
-        
-        for start_node in nodes_with_flow:
+        processed: set = set()
+        cycles: List[List[int]] = []
+
+        for start_node in next_node:
             if start_node in processed:
                 continue
-            
-            cycle = []
+
+            cycle: List[int] = []
             curr = start_node
             while curr not in processed:
                 processed.add(curr)
                 cycle.append(curr)
                 curr = next_node.get(curr)
-                if curr is None: break # Should not happen if degrees are correct
-            
-            # If we looped back to start_node (or any node in current cycle traces), it's a closed loop
-            # Since degree is 1, it must be a set of disjoint cycles.
+                if curr is None:
+                    break  # open path — shouldn't occur when degree constraints hold
+
             cycles.append(cycle)
-            
+
         return cycles
 
     def _extract_routes_and_check_capacity(self, edges: List[Tuple[int, int]], depot_id: int):

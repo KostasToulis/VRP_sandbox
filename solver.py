@@ -1,45 +1,160 @@
 import os
 import setup
+from typing import Dict, List, Tuple
 from metaheuristics.genetic_algorithm import GeneticAlgorithm
 from exact.branch_and_cut import BranchAndCut
 from exact.column_generation import ColumnGeneration
 from metaheuristics.random_key_optimizer import RandomKeyOptimizer
 
-def run():
-    instance_path = os.path.join("instances", "A-n32-k5.vrp")
-    
-    # Ensure folder structure existence for the user if they don't have it locally yet
-    # (In a real scenario, we assume the file exists as per instructions)
-    if not os.path.exists(instance_path):
-        print(f"Instance file not found at {instance_path}")
+
+def validate_solution(model, solution) -> Tuple[bool, List[str]]:
+    """
+    Validate a CVRP solution against core feasibility constraints:
+    1) Capacity constraints per route.
+    2) Each vehicle route departs from and returns to the central depot (implicit representation).
+    3) No subtours/revisits inside routes.
+    4) Every customer is served exactly once.
+    """
+    errors: List[str] = []
+    depot_id = model.depot_id
+    customer_ids = {n.id for n in model.nodes if n.id != depot_id}
+    served_count: Dict[int, int] = {cid: 0 for cid in customer_ids}
+
+    for route in solution.routes:
+        seq = route.sequence_of_nodes
+
+        if not seq:
+            errors.append(f"Route {route.id} is empty.")
+            continue
+
+        route_ids = [n.id for n in seq]
+
+        # Depot should never appear in an explicit route sequence.
+        if depot_id in route_ids:
+            errors.append(f"Route {route.id} contains depot node {depot_id} in sequence.")
+
+        # Subtour/revisit guard: repeated customer in the same route implies a cycle/revisit.
+        if len(route_ids) != len(set(route_ids)):
+            errors.append(f"Route {route.id} contains repeated customers (subtour/revisit detected).")
+
+        # Capacity check based on actual node demands.
+        actual_load = sum(node.demand for node in seq)
+        if actual_load > model.capacity:
+            errors.append(
+                f"Route {route.id} exceeds capacity: load={actual_load}, capacity={model.capacity}."
+            )
+        if route.load != actual_load:
+            errors.append(
+                f"Route {route.id} load mismatch: stored={route.load}, recomputed={actual_load}."
+            )
+
+        # Depot departure/return are implicit, so verify both endpoint depot links are valid.
+        first_id = seq[0].id
+        last_id = seq[-1].id
+        try:
+            _ = model.get_distance(depot_id, first_id)
+            _ = model.get_distance(last_id, depot_id)
+        except KeyError:
+            errors.append(
+                f"Route {route.id} cannot connect to depot {depot_id} from endpoints ({first_id}, {last_id})."
+            )
+
+        for nid in route_ids:
+            if nid not in customer_ids:
+                errors.append(f"Route {route.id} visits invalid customer id {nid}.")
+                continue
+            served_count[nid] += 1
+
+    missing = [cid for cid, cnt in served_count.items() if cnt == 0]
+    duplicates = [cid for cid, cnt in served_count.items() if cnt > 1]
+
+    if missing:
+        errors.append(f"Unserved customers: {sorted(missing)}")
+    if duplicates:
+        errors.append(f"Customers served more than once: {sorted(duplicates)}")
+
+    return len(errors) == 0, errors
+
+_METHOD_ALIASES = {
+    "branch_and_cut": "branch_and_cut",
+    "column_generation": "column_generation",
+    "genetic_algorithm": "genetic_algorithm",
+    "brkga": "random_key_optimizer",
+    "random_key_optimizer": "random_key_optimizer",
+}
+
+_MENU = {
+    "1": "branch_and_cut",
+    "2": "column_generation",
+    "3": "genetic_algorithm",
+    "4": "random_key_optimizer",
+}
+
+
+def solve(instance, method: str, **kwargs):
+    """
+    Solve a CVRP instance with the named methodology.
+
+    Args:
+        instance: A VRPModel produced by setup.read_vrp_file().
+        method:   One of 'branch_and_cut', 'column_generation',
+                  'genetic_algorithm', 'random_key_optimizer' (or 'brkga').
+        **kwargs: Methodology-specific hyperparameters forwarded to the solver.
+
+    Returns:
+        A Solution object with routes and total cost.
+    """
+    method_key = _METHOD_ALIASES.get(method.lower())
+    if method_key is None:
+        raise ValueError(
+            f"Unknown method '{method}'. "
+            f"Valid options: {sorted(_METHOD_ALIASES)}"
+        )
+
+    if method_key == "branch_and_cut":
+        solver = BranchAndCut(instance, **kwargs)
+    elif method_key == "column_generation":
+        solver = ColumnGeneration(instance, **kwargs)
+    elif method_key == "genetic_algorithm":
+        solver = GeneticAlgorithm(instance, **kwargs)
+    else:  # random_key_optimizer
+        solver = RandomKeyOptimizer(instance, **kwargs)
+
+    return solver.solve()
+
+
+def run(choice: str, model) -> None:
+    """Interactive menu dispatcher used by main.py."""
+    method_key = _MENU.get(choice)
+    if choice == "5":
+        print("Exiting program.")
+        return
+    if method_key is None:
+        print("Invalid option. Program terminated.")
         return
 
-    print(f"Loading instance: {instance_path}")
-    model = setup.read_vrp_file(instance_path)
-    
-    # METHODOLOGY SELECTION
-    # Uncomment the methodology you want to run
-    
-    # 1. Genetic Algorithm
-    # print("Solving with Genetic Algorithm...")
-    # ga = GeneticAlgorithm(model, population_size=100, generations=200)
-    # solution = ga.solve()
-    
-    # 2. Branch and Cut
-    # print("Solving with Branch and Cut...")
-    # bc = BranchAndCut(model, time_limit=300) 
-    # solution = bc.solve()
+    label = {
+        "branch_and_cut": "Branch and Cut",
+        "column_generation": "Column Generation",
+        "genetic_algorithm": "Genetic Algorithm",
+        "random_key_optimizer": "Random Key Optimizer (BRKGA)",
+    }[method_key]
+    print(f"Solving with {label}...")
 
-    # 3. Column Generation
-    # print("Solving with Column Generation...")
-    # cg = ColumnGeneration(model)
-    # solution = cg.solve()
+    defaults = {
+        "branch_and_cut": {"time_limit": 300},
+        "column_generation": {},
+        "genetic_algorithm": {"population_size": 100, "generations": 200},
+        "random_key_optimizer": {"population_size": 100, "generations": 300},
+    }
+    solution = solve(model, method=method_key, **defaults[method_key])
 
-    # 4. Random Key Optimizer (BRKGA)
-    print("Solving with Random Key Optimizer (BRKGA)...")
-    rk_opt = RandomKeyOptimizer(model, population_size=100, generations=300)
-    solution = rk_opt.solve()
-    
+    is_valid, validation_errors = validate_solution(model, solution)
+    print(f"\nSolution Feasibility: {'VALID' if is_valid else 'INVALID'}")
+    if not is_valid:
+        for err in validation_errors:
+            print(f"  - {err}")
+
     print("\nBest Solution Found:")
     print(f"Total Cost: {solution.cost:.2f}")
     print(f"Number of Routes: {len(solution.routes)}")
@@ -47,5 +162,3 @@ def run():
         route_str = " -> ".join([str(n.id) for n in r.sequence_of_nodes])
         print(f"  Route {r.id} (Load: {r.load}): {model.depot.id} -> {route_str} -> {model.depot.id}")
 
-if __name__ == "__main__":
-    run()
