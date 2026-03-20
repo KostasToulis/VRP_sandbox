@@ -40,7 +40,7 @@ class VRPModel:
         """Calculates Euclidean distance (EUC_2D) between two nodes."""
         n1 = self.node_map[node1_id]
         n2 = self.node_map[node2_id]
-        return math.sqrt((n1.x - n2.x)**2 + (n1.y - n2.y)**2)
+        return round(math.sqrt((n1.x - n2.x)**2 + (n1.y - n2.y)**2))
 
     def __repr__(self):
         return f"VRPModel(name={self.name}, dimension={self.dimension}, capacity={self.capacity}, depot={self.depot_id})"
