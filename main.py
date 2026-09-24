@@ -19,10 +19,13 @@ if __name__ == "__main__":
     print("2. Column Generation")
     print("3. Genetic Algorithm")
     print("4. Random Key Optimizer (BRKGA)")
-    print("5. Exit")
+    print("5. Minimum Insertion")
+    print("6. Tabu Search")
+    print("7. Promises Search")
+    print("8. Exit")
 
     try:
-        choice = input("Enter your choice (1-5): ").strip()
+        choice = input("Enter your choice (1-8): ").strip()
     except (EOFError, KeyboardInterrupt):
         print("\nProgram terminated.")
         raise SystemExit(0)

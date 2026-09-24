@@ -5,6 +5,34 @@ from metaheuristics.genetic_algorithm import GeneticAlgorithm
 from exact.branch_and_cut import BranchAndCut
 from exact.column_generation import ColumnGeneration
 from metaheuristics.random_key_optimizer import RandomKeyOptimizer
+from heuristics.minimum_insertion import MinimumInsertion
+
+
+def _load_local_search(module_name: str):
+    """
+    Load a module from metaheuristics/local search/ by path.
+
+    'local search' contains a space, so it is not a valid package name and its
+    modules cannot be imported normally. Loading is deferred to call time to
+    keep these off the import path of every other methodology.
+    """
+    import importlib.util
+    import os
+    import sys
+
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "metaheuristics", "local search", f"{module_name}.py",
+    )
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load {module_name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    # Registering before exec_module is required: @dataclass looks the defining
+    # class's module up in sys.modules and fails without it.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def validate_solution(model, solution) -> Tuple[bool, List[str]]:
@@ -81,6 +109,13 @@ _METHOD_ALIASES = {
     "genetic_algorithm": "genetic_algorithm",
     "brkga": "random_key_optimizer",
     "random_key_optimizer": "random_key_optimizer",
+    "minimum_insertion": "minimum_insertion",
+    "min_insertion": "minimum_insertion",
+    "cheapest_insertion": "minimum_insertion",
+    "tabu_search": "tabu_search",
+    "tabu": "tabu_search",
+    "promises_search": "promises_search",
+    "promises": "promises_search",
 }
 
 _MENU = {
@@ -88,6 +123,9 @@ _MENU = {
     "2": "column_generation",
     "3": "genetic_algorithm",
     "4": "random_key_optimizer",
+    "5": "minimum_insertion",
+    "6": "tabu_search",
+    "7": "promises_search",
 }
 
 
@@ -98,7 +136,10 @@ def solve(instance, method: str, **kwargs):
     Args:
         instance: A VRPModel produced by setup.read_vrp_file().
         method:   One of 'branch_and_cut', 'column_generation',
-                  'genetic_algorithm', 'random_key_optimizer' (or 'brkga').
+                  'genetic_algorithm', 'random_key_optimizer' (or 'brkga'),
+                  'minimum_insertion' (or 'min_insertion'/'cheapest_insertion'),
+                  'tabu_search' (or 'tabu'),
+                  'promises_search' (or 'promises').
         **kwargs: Methodology-specific hyperparameters forwarded to the solver.
 
     Returns:
@@ -117,6 +158,12 @@ def solve(instance, method: str, **kwargs):
         solver = ColumnGeneration(instance, **kwargs)
     elif method_key == "genetic_algorithm":
         solver = GeneticAlgorithm(instance, **kwargs)
+    elif method_key == "minimum_insertion":
+        solver = MinimumInsertion(instance, **kwargs)
+    elif method_key == "tabu_search":
+        solver = _load_local_search("tabu_search").TabuSearch(instance, **kwargs)
+    elif method_key == "promises_search":
+        solver = _load_local_search("promises_search").PromisesSearch(instance, **kwargs)
     else:  # random_key_optimizer
         solver = RandomKeyOptimizer(instance, **kwargs)
 
@@ -126,7 +173,7 @@ def solve(instance, method: str, **kwargs):
 def run(choice: str, model) -> None:
     """Interactive menu dispatcher used by main.py."""
     method_key = _MENU.get(choice)
-    if choice == "5":
+    if choice == "8":
         print("Exiting program.")
         return
     if method_key is None:
@@ -138,6 +185,9 @@ def run(choice: str, model) -> None:
         "column_generation": "Column Generation",
         "genetic_algorithm": "Genetic Algorithm",
         "random_key_optimizer": "Random Key Optimizer (BRKGA)",
+        "minimum_insertion": "Minimum Insertion",
+        "tabu_search": "Tabu Search",
+        "promises_search": "Promises Search",
     }[method_key]
     print(f"Solving with {label}...")
 
@@ -146,6 +196,11 @@ def run(choice: str, model) -> None:
         "column_generation": {},
         "genetic_algorithm": {"population_size": 100, "generations": 200},
         "random_key_optimizer": {"population_size": 100, "generations": 300},
+        "minimum_insertion": {"strategy": "sequential", "seed_rule": "farthest"},
+        # Empty: tabu_search.py hosts its own parameter defaults at the top.
+        "tabu_search": {},
+        # Empty: promises_search.py hosts its own parameter defaults at the top.
+        "promises_search": {},
     }
     solution = solve(model, method=method_key, **defaults[method_key])
 

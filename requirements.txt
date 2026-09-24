@@ -1,0 +1,31 @@
+# CVRP Sandbox - project requirements
+#
+# Requires Python 3.10 or newer: the codebase uses PEP 604 unions (e.g. `int | None`
+# in metaheuristics/genetic_algorithm.py), and PuLP itself declares requires-python >=3.10.
+#
+# Install with:
+#   pip install -r requirements.txt
+
+# --- Runtime dependencies (actually imported by the code) --------------------
+
+# Linear/integer programming modelling layer, plus the bundled CBC solver binary.
+# Imported by the exact methods:
+#   exact/branch_and_cut.py     -> LpProblem, LpVariable, lpSum, PULP_CBC_CMD, LpStatusOptimal
+#   exact/column_generation.py  -> LpProblem, LpVariable, lpSum, value, LpContinuous
+# solver.py imports both modules eagerly at module load, so PuLP is needed to run
+# ANY methodology, not only the exact ones.
+pulp>=2.7,<4.0
+
+# --- Deliberately not installed ----------------------------------------------
+#
+# CLAUDE.md sanctions the packages below for future methodologies, but nothing in
+# the repository imports them today. Uncomment a line when a methodology actually
+# needs it - torch in particular is a multi-gigabyte download that would otherwise
+# be pulled in for no reason.
+#
+# numpy>=1.24      # numerical work in heuristics/ and metaheuristics/
+# ortools>=9.8     # alternative exact / CP-SAT backend for exact/
+# torch>=2.2       # learning-based approaches in ml/
+#
+# Everything else the project uses is standard library: dataclasses, math, random,
+# os, sys, logging, typing.

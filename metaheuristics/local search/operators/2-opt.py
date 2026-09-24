@@ -1,0 +1,381 @@
+r"""
+2-opt neighbourhood operator for the CVRP (intra-route).
+
+A 2-opt move removes two edges from a single route's tour and reconnects the
+two resulting paths the other way round, which reverses the segment between
+them:
+
+    before:   depot - ... - a - b - ... - c - d - ... - depot
+    after:    depot - ... - a - c - ... - b - d - ... - depot
+                            \___ reversed ___/
+
+Replacing edges (a,b) and (c,d) with (a,c) and (b,d) costs:
+
+    delta = d(a,c) + d(b,d) - d(a,b) - d(c,d)
+
+This is the classic Croes (1958) / Lin (1965) move that removes crossings from
+a tour. It operates inside one route at a time and therefore never changes any
+route's customer set: every 2-opt move is automatically capacity-feasible, and
+no route can be emptied.
+
+Scope: this is intra-route 2-opt. The inter-route variant that exchanges route
+tails (2-opt*, Potvin & Rousseau 1995) is a different neighbourhood and is not
+implemented here; relocate.py and swap.py provide the inter-route moves.
+
+`find_best_move` scans the whole neighbourhood and returns the single cheapest
+feasible move, or None when the neighbourhood is empty.
+
+Dependencies: standard library only.
+
+NOTE: this file lives under 'metaheuristics/local search/operators/' and is
+named '2-opt.py'. Neither the space in 'local search' nor a module name
+starting with a digit and containing a hyphen is a valid Python identifier, so
+this module cannot be reached with a plain `import` - it must be loaded with
+importlib.util.spec_from_file_location (see the __main__ block below for the
+pattern), or the file and folder must be renamed to 'two_opt.py' and
+'local_search'.
+"""
+
+from __future__ import annotations
+
+# Running this file directly puts the operators folder on sys.path rather than
+# the repository root, which would make the `model` import below fail. Add the
+# root up front. This is a no-op when a driver has already imported the module.
+if __name__ == "__main__":
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(
+        0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "..", ".."))
+    )
+
+import logging
+from collections import Counter
+from dataclasses import dataclass
+from typing import AbstractSet, Dict, List, Mapping, Optional, Tuple
+
+from model import VRPModel, Route, Solution, Node
+
+logger = logging.getLogger(__name__)
+
+DistanceMatrix = Dict[int, Dict[int, float]]
+Arc = Tuple[int, int]
+
+
+def arc(a: int, b: int) -> Arc:
+    """
+    Canonical key for the undirected arc between two nodes.
+
+    Distances in this project are symmetric and 2-opt reverses whole segments,
+    so (a,b) and (b,a) are the same physical link and must share one tabu entry.
+    The arcs interior to a reversed segment are exactly these flipped pairs,
+    which is why the move only ever changes the two boundary links.
+    """
+    return (a, b) if a <= b else (b, a)
+
+
+@dataclass(frozen=True)
+class TwoOptMove:
+    """
+    A single intra-route 2-opt move.
+
+    The route's tour is read as [depot] + sequence + [depot]. The move drops the
+    tour edges leaving tour position `i` and `j` and reverses everything between
+    them, which in terms of the stored customer sequence reverses the half-open
+    slice sequence[i:j].
+
+    Attributes:
+        route: index into solution.routes.
+        i:     start of the reversed slice (0 == the depot->first-customer edge).
+        j:     end of the reversed slice, exclusive (len(sequence) == the
+               last-customer->depot edge).
+        delta: change in total cost; negative means an improvement.
+        removed_arcs: the two boundary links this move destroys. A tabu driver
+               forbids restoring these for the length of the tenure.
+        added_arcs: the two boundary links this move creates. The move is tabu
+               when either of them is currently forbidden.
+
+    Only the two boundary links change: everything inside the reversed segment
+    keeps the same undirected arcs, just traversed the other way.
+    """
+
+    route: int
+    i: int
+    j: int
+    delta: float
+    removed_arcs: Tuple[Arc, ...] = ()
+    added_arcs: Tuple[Arc, ...] = ()
+
+    def apply(
+        self,
+        solution: Solution,
+        model: VRPModel,
+        dist: Optional[DistanceMatrix] = None,
+    ) -> Solution:
+        """
+        Return a NEW Solution with this move applied; `solution` is left untouched.
+
+        Route ids are renumbered from 1, matching how solutions are built
+        elsewhere in the project. A 2-opt move cannot empty a route.
+        """
+        if dist is None:
+            dist = build_distance_matrix(model)
+
+        sequences = [list(r.sequence_of_nodes) for r in solution.routes]
+        seq = sequences[self.route]
+        sequences[self.route] = seq[: self.i] + seq[self.i: self.j][::-1] + seq[self.j:]
+
+        return _rebuild(sequences, model, dist)
+
+
+def _net_arcs(removed, added):
+    """
+    Reduce a move's raw arc lists to the traversals it actually changes.
+
+    Bookkeeping is done on TRAVERSAL COUNTS, not mere presence, because a route
+    serving a single customer drives the depot-customer link twice: in
+    depot -> u -> depot the arc (depot, u) is used twice over. Inserting a
+    customer ahead of u therefore consumes one of those two traversals while
+    leaving the link in place, and a tabu driver wants that change recorded -
+    it is exactly what stops the search undoing the insertion next iteration.
+
+    Self-loops are dropped (predecessor and successor are both the depot when a
+    route holds one customer), and a link destroyed and immediately recreated
+    cancels out, since an untouched traversal must not become tabu nor block
+    the move that leaves it alone.
+    """
+    removed_count = Counter(a for a in removed if a[0] != a[1])
+    added_count = Counter(a for a in added if a[0] != a[1])
+    return (
+        tuple(sorted((removed_count - added_count).elements())),
+        tuple(sorted((added_count - removed_count).elements())),
+    )
+
+
+def _promise_blocks(promises, added, new_cost):
+    """
+    Promise rule: an arc carries the cost of the solution it was deleted from.
+
+    Re-creating it is only worth doing if the search can do better than it was
+    doing when it let the arc go, so the move is blocked unless the solution it
+    produces is strictly cheaper than that recorded label. An arc absent from
+    the mapping has an implicit promise of infinity and is therefore free.
+    """
+    for a in added:
+        limit = promises.get(a)
+        if limit is not None and new_cost >= limit:
+            return True
+    return False
+
+
+def build_distance_matrix(model: VRPModel) -> DistanceMatrix:
+    """
+    Pre-compute all pairwise distances.
+
+    VRPModel.get_distance recomputes a square root and a rounding on every call,
+    and a neighbourhood scan touches it O(n^2) times, so a driver running many
+    iterations should build this once and pass it to every call.
+    """
+    return {
+        a.id: {b.id: model.get_distance(a.id, b.id) for b in model.nodes}
+        for a in model.nodes
+    }
+
+
+def find_best_move(
+    solution: Solution,
+    model: VRPModel,
+    *,
+    only_improving: bool = False,
+    dist: Optional[DistanceMatrix] = None,
+    tabu_arcs: Optional[AbstractSet[Arc]] = None,
+    aspiration_delta: Optional[float] = None,
+    arc_promises: Optional[Mapping[Arc, float]] = None,
+) -> Optional[TwoOptMove]:
+    """
+    Find the cheapest 2-opt move in `solution`.
+
+    Args:
+        solution:       the incumbent solution to search around.
+        model:          the VRPModel, needed for distances and the depot.
+        only_improving: if True, return None unless the best move strictly
+                        reduces cost (delta < 0). If False (the default) the
+                        globally cheapest move is returned even when it worsens
+                        the solution, which is what tabu search and other
+                        non-monotone drivers need.
+        dist:           optional pre-computed distance matrix.
+        tabu_arcs:      arcs that must not be recreated. Any move that would add
+                        one of them is skipped, so the returned move is the best
+                        NON-TABU move rather than the best move overall. Pass a
+                        set (or dict keys) for O(1) membership tests.
+        aspiration_delta: standard aspiration-by-objective escape hatch. A tabu
+                        move is admitted anyway when its delta is strictly below
+                        this value; a driver sets it to
+                        `best_cost - current_cost` so a move is allowed when it
+                        would beat the best solution seen so far. None disables
+                        aspiration, making the tabu ban absolute.
+        arc_promises:   per-arc alternative to the flat `tabu_arcs` ban, used by
+                        the promises search. Maps an arc to the cost of the
+                        solution it was deleted from; a move that re-creates
+                        that arc is skipped unless the solution it produces
+                        costs strictly less than the recorded label. An arc that
+                        is absent has an implicit promise of infinity and is
+                        free. The aspiration criterion is built into this rule,
+                        so `aspiration_delta` does not apply to it; a driver
+                        uses either this scheme or `tabu_arcs`, not both.
+
+    Returns:
+        The best admissible TwoOptMove, or None when no route is long enough to
+        offer one and no non-tabu move remains.
+
+    Ties are broken by the move's index tuple, so the result is deterministic.
+    """
+    if dist is None:
+        dist = build_distance_matrix(model)
+
+    depot_id = model.depot_id
+    # Recomputed rather than trusting Solution.cost, which may be stale.
+    base_cost = (
+        sum(_route_cost(r.sequence_of_nodes, model, dist) for r in solution.routes)
+        if arc_promises
+        else 0.0
+    )
+    best: Optional[TwoOptMove] = None
+
+    for route_index, route in enumerate(solution.routes):
+        seq = route.sequence_of_nodes
+        length = len(seq)
+
+        # Reading the tour as [depot] + seq + [depot], tour position k holds
+        # seq[k-1]. Reversing a slice shorter than two customers is a no-op, so
+        # j starts at i + 2.
+        for i in range(length - 1):
+            left_id = depot_id if i == 0 else seq[i - 1].id
+            first_id = seq[i].id
+
+            for j in range(i + 2, length + 1):
+                # Reversing the entire route just drives the same tour backwards;
+                # with symmetric distances that is always a zero-delta no-op.
+                if i == 0 and j == length:
+                    continue
+
+                last_id = seq[j - 1].id
+                right_id = depot_id if j == length else seq[j].id
+
+                delta = (
+                    dist[left_id][last_id]
+                    + dist[first_id][right_id]
+                    - dist[left_id][first_id]
+                    - dist[last_id][right_id]
+                )
+
+                # Only a candidate that would become the new best is worth the
+                # arc bookkeeping, so do the cheap comparison first.
+                if best is not None and not (
+                    delta < best.delta
+                    or (
+                        delta == best.delta
+                        and (route_index, i, j) < (best.route, best.i, best.j)
+                    )
+                ):
+                    continue
+
+                removed_net, added_net = _net_arcs(
+                    (arc(left_id, first_id), arc(last_id, right_id)),
+                    (arc(left_id, last_id), arc(first_id, right_id)),
+                )
+
+                if tabu_arcs and any(a in tabu_arcs for a in added_net):
+                    # Blocked, unless it is good enough to aspire past the ban.
+                    if aspiration_delta is None or delta >= aspiration_delta:
+                        continue
+
+                if arc_promises and _promise_blocks(arc_promises, added_net, base_cost + delta):
+                    # Re-creating a promised arc without beating its label.
+                    continue
+
+                best = TwoOptMove(
+                    route=route_index,
+                    i=i,
+                    j=j,
+                    delta=delta,
+                    removed_arcs=removed_net,
+                    added_arcs=added_net,
+                )
+
+    if best is None:
+        logger.debug("2-opt: neighbourhood is empty (no route has 3+ customers).")
+        return None
+
+    if only_improving and best.delta >= 0:
+        logger.debug("2-opt: no improving move (best delta %.2f).", best.delta)
+        return None
+
+    logger.debug(
+        "2-opt: route %d, reversing positions %d:%d, delta %.2f.",
+        best.route, best.i, best.j, best.delta,
+    )
+    return best
+
+
+def _route_cost(seq: List[Node], model: VRPModel, dist: DistanceMatrix) -> float:
+    """Closed-tour cost depot -> seq -> depot."""
+    if not seq:
+        return 0.0
+    depot_id = model.depot_id
+    cost = dist[depot_id][seq[0].id]
+    for a, b in zip(seq, seq[1:]):
+        cost += dist[a.id][b.id]
+    return float(cost + dist[seq[-1].id][depot_id])
+
+
+def _rebuild(
+    sequences: List[List[Node]], model: VRPModel, dist: DistanceMatrix
+) -> Solution:
+    """Turn customer sequences into a Solution, dropping any emptied route."""
+    routes: List[Route] = []
+    for seq in sequences:
+        if not seq:
+            continue
+        routes.append(
+            Route(
+                id=len(routes) + 1,
+                load=sum(n.demand for n in seq),
+                cost=_route_cost(seq, model, dist),
+                sequence_of_nodes=list(seq),
+            )
+        )
+    return Solution(cost=sum(r.cost for r in routes), routes=routes)
+
+
+if __name__ == "__main__":
+    import setup
+    from heuristics.minimum_insertion import solve as construct
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    _root = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "..", ".."))
+    _model = setup.read_vrp_file(_os.path.join(_root, "instances", "A-n32-k5.vrp"))
+    _solution = construct(_model)
+    _move = find_best_move(_solution, _model)
+
+    print(f"start cost : {_solution.cost:.0f} ({len(_solution.routes)} routes)")
+    print(f"best move  : {_move}")
+    if _move is not None:
+        _improved = _move.apply(_solution, _model)
+        print(f"after move : {_improved.cost:.0f} ({len(_improved.routes)} routes)")
+
+    # Because of the file name, a driver has to load this module explicitly:
+    #
+    #   import importlib.util, sys
+    #   spec = importlib.util.spec_from_file_location(
+    #       "two_opt", os.path.join(root, "metaheuristics", "local search",
+    #                               "operators", "2-opt.py"))
+    #   two_opt = importlib.util.module_from_spec(spec)
+    #   sys.modules[spec.name] = two_opt      # required: @dataclass looks the
+    #   spec.loader.exec_module(two_opt)      # module up in sys.modules
+    #   move = two_opt.find_best_move(solution, model)
+    #
+    # Registering in sys.modules before exec_module is not optional - without it
+    # @dataclass raises AttributeError: 'NoneType' object has no attribute
+    # '__dict__' while resolving the class's own module namespace.
